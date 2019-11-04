@@ -826,13 +826,16 @@ class GoogleClient(OAuth2Client):
     @staticmethod
     def user_parse(data):
         """Parse information from provider."""
-        yield 'id', data.get('id')
-        yield 'email', data.get('email')
-        yield 'first_name', data.get('given_name')
-        yield 'last_name', data.get('family_name')
+        yield 'id', data.get('sub') or data.get('id')
+        yield 'username', data.get('nickname')
+        for email in data.get('emails', []):
+            if email['type'] == 'account':
+                yield 'email', email['value']
+        yield 'first_name', data.get('name', {}).get('givenName')
+        yield 'last_name', data.get('name', {}).get('familyName')
         yield 'link', data.get('link')
         yield 'locale', data.get('locale')
-        yield 'picture', data.get('picture')
+        yield 'picture', data.get('image', {}).get('url')
         yield 'gender', data.get('gender')
 
 
