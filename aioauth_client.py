@@ -5,7 +5,7 @@ import base64
 import hmac
 import logging
 import time
-from hashlib import sha1
+from hashlib import sha1, sha256
 from random import SystemRandom
 from urllib.parse import parse_qsl, quote, urlencode, urljoin, urlsplit
 
@@ -713,16 +713,19 @@ class FacebookClient(OAuth2Client):
 
     access_token_url = 'https://graph.facebook.com/oauth/access_token'
     authorize_url = 'https://www.facebook.com/dialog/oauth'
-    base_url = 'https://graph.facebook.com/v2.4'
+    base_url = 'https://graph.facebook.com/v5.0'
     name = 'facebook'
     user_info_url = 'https://graph.facebook.com/me'
 
     async def user_info(self, params=None, **kwargs):
         """Facebook required fields-param."""
         params = params or {}
-        params[
-            'fields'] = 'id,email,first_name,last_name,name,link,locale,' \
+        params['fields'] = 'id,email,first_name,last_name,name,link,locale,' \
                         'gender,location'
+        if self.access_token:
+            params["appsecret_proof"] = hmac.new(self.client_secret.encode('utf-8'),
+                                                 self.access_token.encode('utf-8'), sha256).hexdigest()
+
         return await super(FacebookClient, self).user_info(params=params, **kwargs)
 
     @staticmethod
