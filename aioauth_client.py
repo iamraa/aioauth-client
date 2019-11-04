@@ -26,12 +26,12 @@ RANDOM = SystemRandom().random
 class User:
     """Store user's information."""
 
-    __slots__ = 'id', 'email', 'first_name', 'last_name', 'username', 'picture', \
+    attrs = 'id', 'email', 'first_name', 'last_name', 'username', 'picture', \
         'link', 'locale', 'city', 'country', 'gender'
 
     def __init__(self, **info):
         """Initialize self data."""
-        for attr in self.__slots__:
+        for attr in self.attrs:
             setattr(self, attr, info.get(attr))
 
 
@@ -826,16 +826,13 @@ class GoogleClient(OAuth2Client):
     @staticmethod
     def user_parse(data):
         """Parse information from provider."""
-        yield 'id', data.get('sub') or data.get('id')
-        yield 'username', data.get('nickname')
-        for email in data.get('emails', []):
-            if email['type'] == 'account':
-                yield 'email', email['value']
-        yield 'first_name', data.get('name', {}).get('givenName')
-        yield 'last_name', data.get('name', {}).get('familyName')
+        yield 'id', data.get('id')
+        yield 'email', data.get('email')
+        yield 'first_name', data.get('given_name')
+        yield 'last_name', data.get('family_name')
         yield 'link', data.get('link')
         yield 'locale', data.get('locale')
-        yield 'picture', data.get('image', {}).get('url')
+        yield 'picture', data.get('picture')
         yield 'gender', data.get('gender')
 
 
