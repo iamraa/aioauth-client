@@ -334,7 +334,13 @@ class OAuth2Client(Client):
 
         if not isinstance(code, str) and self.shared_key in code:
             code = code[self.shared_key]
-        payload['refresh_token' if payload['grant_type'] == 'refresh_token' else 'code'] = code
+
+        if payload['grant_type'] == 'refresh_token':
+            payload['refresh_token'] = code
+        elif payload['grant_type'] == 'fb_exchange_token':
+            payload['fb_exchange_token'] = code
+        else:
+            payload['code'] = code
 
         redirect_uri = redirect_uri or self.params.get('redirect_uri')
         if redirect_uri:
