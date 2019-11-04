@@ -9,28 +9,30 @@ from hashlib import sha1
 from random import SystemRandom
 from urllib.parse import parse_qsl, quote, urlencode, urljoin, urlsplit
 
+import aiohttp
 import yarl
-from aiohttp import BasicAuth, ClientSession, web
+from aiohttp import BasicAuth, web
 
-__version__ = "0.10.0"
+
+__version__ = "0.17.3"
 __project__ = "aioauth-client"
 __author__ = "Kirill Klenov <horneds@gmail.com>"
 __license__ = "MIT"
 
 
+RANDOM = SystemRandom().random
+
+
 class User:
-    """Store information about user."""
+    """Store user's information."""
 
-    attrs = 'id', 'email', 'first_name', 'last_name', 'username', 'picture', \
-            'link', 'locale', 'city', 'country', 'gender'
+    __slots__ = 'id', 'email', 'first_name', 'last_name', 'username', 'picture', \
+        'link', 'locale', 'city', 'country', 'gender'
 
-    def __init__(self, **kwargs):
+    def __init__(self, **info):
         """Initialize self data."""
-        for attr in self.attrs:
-            setattr(self, attr, kwargs.get(attr))
-
-
-random = SystemRandom().random
+        for attr in self.__slots__:
+            setattr(self, attr, info.get(attr))
 
 
 class Signature(object):
@@ -97,8 +99,7 @@ class ClientRegistry(type):
     def __new__(mcs, name, bases, params):
         """Save created client in self registry."""
         cls = super().__new__(mcs, name, bases, params)
-        if cls.name:
-            mcs.clients[cls.name] = cls
+        mcs.clients[cls.name] = cls
         return cls
 
 
@@ -114,13 +115,14 @@ class Client(object, metaclass=ClientRegistry):
     user_info_url = None
 
     def __init__(self, base_url=None, authorize_url=None, access_token_key=None,
-                 access_token_url=None, logger=None):
+                 access_token_url=None, session=None, logger=None):
         """Initialize the client."""
         self.base_url = base_url or self.base_url
         self.authorize_url = authorize_url or self.authorize_url
         self.access_token_key = access_token_key or self.access_token_key
         self.access_token_url = access_token_url or self.access_token_url
         self.logger = logger or logging.getLogger('OAuth: %s' % self.name)
+        self.session = session
 
     def _get_url(self, url):
         """Build provider's url. Join with base_url part if needed."""
@@ -136,47 +138,44 @@ class Client(object, metaclass=ClientRegistry):
         """String representation."""
         return "<%s>" % self
 
+    async def _request(self, method, url, loop=None, timeout=None, **kwargs):
+        """Make a request through AIOHTTP."""
+        session = self.session or aiohttp.ClientSession(
+            loop=loop, conn_timeout=timeout, read_timeout=timeout)
+        try:
+            async with session.request(method, url, **kwargs) as response:
+
+                if response.status / 100 > 2:
+                    raise web.HTTPBadRequest(
+                        reason='HTTP status code: %s' % response.status)
+
+                if 'json' in response.headers.get('CONTENT-TYPE'):
+                    data = await response.json()
+                else:
+                    data = await response.text()
+                    data = dict(parse_qsl(data))
+
+                return data
+
+        except asyncio.TimeoutError:
+            raise web.HTTPBadRequest(reason='HTTP Timeout')
+
+        finally:
+            if not self.session and not session.closed:
+                await session.close()
+
     def request(self, method, url, params=None, headers=None, loop=None,
                 **aio_kwargs):
         """Make a request to provider."""
         raise NotImplementedError('Shouldnt be called.')
 
-    async def correct_request(self, method, url, params=None, headers=None,
-                              loop=None, **kwargs):
-        """
-        Correct request through AIOHTTP
-
-        :param method:
-        :param url:
-        :param params:
-        :param headers:
-        :param loop:
-        :param kwargs:
-        :return:
-        """
-        async with ClientSession(loop=loop) as client:
-            async with client.request(method, url, params=params,
-                                      headers=headers, **kwargs) as resp:
-                if resp.status / 100 > 2:
-                    raise web.HTTPBadRequest(
-                        reason='HTTP status code: %s' % resp.status)
-
-                if 'json' in resp.headers.get('CONTENT-TYPE'):
-                    data = await resp.json()
-                else:
-                    data = dict(parse_qsl(await resp.text()))
-
-        return data
-
-    @asyncio.coroutine
-    def user_info(self, loop=None, **kwargs):
+    async def user_info(self, loop=None, **kwargs):
         """Load user information from provider."""
         if not self.user_info_url:
             raise NotImplementedError(
                 'The provider doesnt support user_info method.')
 
-        data = yield from self.request('GET', self.user_info_url, loop=loop,
-                                       **kwargs)
+        data = await self.request('GET', self.user_info_url, loop=loop, **kwargs)
         user = User(**dict(self.user_parse(data)))
         return user, data
 
@@ -198,12 +197,12 @@ class OAuth1Client(Client):
                  authorize_url=None,
                  oauth_token=None, oauth_token_secret=None,
                  request_token_url=None,
-                 access_token_url=None, access_token_key=None, logger=None,
+                 access_token_url=None, access_token_key=None, session=None, logger=None,
                  signature=None,
                  **params):
         """Initialize the client."""
         super().__init__(base_url, authorize_url, access_token_key,
-                         access_token_url, logger)
+                         access_token_url, session, logger)
 
         self.oauth_token = oauth_token
         self.oauth_token_secret = oauth_token_secret
@@ -218,12 +217,11 @@ class OAuth1Client(Client):
         params.update({'oauth_token': request_token or self.oauth_token})
         return self.authorize_url + '?' + urlencode(params)
 
-    def request(self, method, url, params=None, headers=None, timeout=10,
-                loop=None, **aio_kwargs):
+    def request(self, method, url, params=None, **aio_kwargs):
         """Make a request to provider."""
         oparams = {
             'oauth_consumer_key': self.consumer_key,
-            'oauth_nonce': sha1(str(random()).encode('ascii')).hexdigest(),
+            'oauth_nonce': sha1(str(RANDOM()).encode('ascii')).hexdigest(),
             'oauth_signature_method': self.signature.name,
             'oauth_timestamp': str(int(time.time())),
             'oauth_version': self.version,
@@ -244,32 +242,25 @@ class OAuth1Client(Client):
             self.consumer_secret, method, url,
             oauth_token_secret=self.oauth_token_secret, **oparams)
         self.logger.debug("%s %s", url, oparams)
-        return asyncio.wait_for(
-            self.correct_request(method, url, params=params, headers=headers,
-                                 loop=loop, **aio_kwargs),
-            timeout, loop=loop)
 
-    @asyncio.coroutine
-    def get_request_token(self, loop=None, **params):
+        return self._request(method, url, params=oparams, **aio_kwargs)
+
+    async def get_request_token(self, loop=None, **params):
         """Get a request_token and request_token_secret from OAuth1 provider."""
         params = dict(self.params, **params)
-        data = yield from self.request('GET', self.request_token_url,
-                                       params=params, loop=loop)
+        data = await self.request('GET', self.request_token_url, params=params, loop=loop)
 
         self.oauth_token = data.get('oauth_token')
         self.oauth_token_secret = data.get('oauth_token_secret')
         return self.oauth_token, self.oauth_token_secret, data
 
-    @asyncio.coroutine
-    def get_access_token(self, oauth_verifier, request_token=None, loop=None,
-                         **params):
+    async def get_access_token(self, oauth_verifier, request_token=None, loop=None, **params):
         """Get access_token from OAuth1 provider.
 
         :returns: (access_token, access_token_secret, provider_data)
         """
         # Possibility to provide REQUEST DATA to the method
-        if not isinstance(oauth_verifier,
-                          str) and self.shared_key in oauth_verifier:
+        if not isinstance(oauth_verifier, str) and self.shared_key in oauth_verifier:
             oauth_verifier = oauth_verifier[self.shared_key]
 
         if request_token and self.oauth_token != request_token:
@@ -277,9 +268,8 @@ class OAuth1Client(Client):
                 reason='Failed to obtain OAuth 1.0 access token. '
                        'Request token is invalid')
 
-        data = yield from self.request('POST', self.access_token_url, params={
-            'oauth_verifier': oauth_verifier, 'oauth_token': request_token},
-                                       loop=loop)
+        data = await self.request('POST', self.access_token_url, params={
+            'oauth_verifier': oauth_verifier, 'oauth_token': request_token}, loop=loop)
 
         self.oauth_token = data.get('oauth_token')
         self.oauth_token_secret = data.get('oauth_token_secret')
@@ -296,11 +286,11 @@ class OAuth2Client(Client):
     def __init__(self, client_id, client_secret, base_url=None,
                  authorize_url=None,
                  access_token=None, access_token_url=None,
-                 access_token_key=None, logger=None,
+                 access_token_key=None, session=None, logger=None,
                  **params):
         """Initialize the client."""
         super().__init__(base_url, authorize_url, access_token_key,
-                         access_token_url, logger)
+                         access_token_url, session, logger)
 
         self.access_token = access_token
         self.client_id = client_id
@@ -313,80 +303,57 @@ class OAuth2Client(Client):
         params.update({'client_id': self.client_id, 'response_type': 'code'})
         return self.authorize_url + '?' + urlencode(params)
 
-    def request(self, method, url, params=None, headers=None, timeout=10,
-                loop=None, **aio_kwargs):
+    def request(self, method, url, params=None, headers=None, access_token=None, **aio_kwargs):
         """Request OAuth2 resource."""
         url = self._get_url(url)
         params = params or {}
 
-        if self.access_token:
-            params[self.access_token_key] = self.access_token
+        access_token = access_token or self.access_token
+        if access_token:
+            if isinstance(params, list):
+                if self.access_token_key not in dict(params):
+                    params.append((self.access_token_key, access_token))
+
+            else:
+                params[self.access_token_key] = access_token
 
         headers = headers or {
             'Accept': 'application/json',
             'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8',
         }
-        return asyncio.wait_for(
-            self.correct_request(method, url, params=params, headers=headers,
-                                 loop=loop, **aio_kwargs),
-            timeout, loop=loop)
+        return self._request(method, url, params=params, headers=headers, **aio_kwargs)
 
-    @asyncio.coroutine
-    def get_access_token(self, code, loop=None, redirect_uri=None, **payload):
+    async def get_access_token(self, code, loop=None, redirect_uri=None, **payload):
         """Get an access_token from OAuth provider.
 
         :returns: (access_token, provider_data)
         """
         # Possibility to provide REQUEST DATA to the method
+        payload.setdefault('grant_type', 'authorization_code')
+        payload.update({'client_id': self.client_id, 'client_secret': self.client_secret})
+
         if not isinstance(code, str) and self.shared_key in code:
             code = code[self.shared_key]
-        payload.setdefault('grant_type', 'authorization_code')
-        payload.update({
-            'client_id': self.client_id,
-            'client_secret': self.client_secret,
-            'code': code,
-        })
+        payload['refresh_token' if payload['grant_type'] == 'refresh_token' else 'code'] = code
 
         redirect_uri = redirect_uri or self.params.get('redirect_uri')
         if redirect_uri:
             payload['redirect_uri'] = redirect_uri
 
+        self.access_token = None
+        data = await self.request('POST', self.access_token_url, data=payload, loop=loop)
+
         try:
-            data = yield from self.request('POST', self.access_token_url,
-                                           data=payload, loop=loop)
             self.access_token = data['access_token']
-        except Exception:
-            raise web.HTTPBadRequest(
-                reason='Failed to obtain OAuth access token.')
+
+        except KeyError:
+            self.logger.error(
+                'Error when getting the access token.\nData returned by OAuth server: %r',
+                data,
+            )
+            raise web.HTTPBadRequest(reason='Failed to obtain OAuth access token.')
 
         return self.access_token, data
-
-
-class BitbucketClient(OAuth1Client):
-    """Support Bitbucket.
-
-    * Dashboard: https://bitbucket.org/account/user/peterhudec/api
-    * Docs: https://confluence.atlassian.com/display/BITBUCKET/oauth+Endpoint
-    * API refer: https://confluence.atlassian.com/display/BITBUCKET/Using+the+Bitbucket+REST+APIs
-    """
-
-    access_token_url = 'https://bitbucket.org/!api/1.0/oauth/access_token'
-    authorize_url = 'https://bitbucket.org/!api/1.0/oauth/authenticate'
-    base_url = 'https://api.bitbucket.org/1.0/'
-    name = 'bitbucket'
-    request_token_url = 'https://bitbucket.org/!api/1.0/oauth/request_token'
-    user_info_url = 'https://api.bitbucket.org/1.0/user'
-
-    @staticmethod
-    def user_parse(data):
-        """Parse information from the provider."""
-        user_ = data.get('user')
-        yield 'id', user_.get('username')
-        yield 'username', user_.get('username')
-        yield 'first_name', user_.get('first_name')
-        yield 'last_name', user_.get('last_name')
-        yield 'picture', user_.get('avatar')
-        yield 'link', user_.get('resource_url')
 
 
 class Bitbucket2Client(OAuth2Client):
@@ -413,24 +380,50 @@ class Bitbucket2Client(OAuth2Client):
         yield 'picture', links.get('avatar', {}).get('href')
         yield 'link', links.get('html', {}).get('href')
 
-    def request(self, method, url, params=None, headers=None, timeout=10,
-                loop=None, **aio_kwargs):
-        """Request OAuth2 resource."""
-        url = self._get_url(url)
-        if self.access_token:
-            headers = headers or {'Accept': 'application/json'}
-            headers['Authorization'] = "Bearer {}".format(self.access_token)
+    def _request(self, method, url, headers=None, params=None, **aio_kwargs):
+        """Setup Authorization Header.."""
+        auth = None
+        access_token = params.pop(self.access_token_key, self.access_token)
+        headers = headers or {}
+        if access_token:
+            headers['Authorization'] = "Bearer %s" % access_token
         else:
-            BasicAuth(self.client_id, self.client_secret)
-            headers = headers or {
-                'Accept': 'application/json',
-                'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8',
-            }
-        # noinspection PyArgumentList
-        return asyncio.wait_for(
-            self.correct_request(method, url, params=params, headers=headers,
-                                 loop=loop, **aio_kwargs),
-            timeout, loop=loop)
+            auth = BasicAuth(self.client_id, self.client_secret)
+
+        return super(Bitbucket2Client, self)._request(
+            method, url, headers=headers, params=params, auth=auth, **aio_kwargs)
+
+
+class DiscordClient(OAuth2Client):
+    """Support Discord API
+
+    * Dashboard: https://discordapp.com/developers/applications/me
+    * Docs: https://discordapp.com/developers/docs/topics/oauth2
+    * API refer: https://discordapp.com/developers/docs/reference
+    """
+
+    access_token_url = 'https://discordapp.com/api/oauth2/token'
+    authorize_url = 'https://discordapp.com/api/oauth2/authorize'
+    base_url = 'https://discordapp.com/api/v6/'
+    name = 'discord'
+    user_info_url = 'https://discordapp.com/api/v6/users/@me'
+
+    @staticmethod
+    def user_parse(data):
+        """Parse information from the provider."""
+        yield 'id', data.get('id')
+        yield 'username', data.get('username')
+        yield 'discriminator', data.get('discriminator')
+        yield 'picture', "https://cdn.discordapp.com/avatars/{}/{}.png".format(
+            data.get('id'), data.get('avatar'))
+
+    def _request(self, method, url, headers=None, params=None, **aio_kwargs):
+        """Setup Authorization Header.."""
+        access_token = params.pop(self.access_token_key, None)
+        if access_token:
+            headers['Authorization'] = "Bearer %s" % access_token
+        return super(DiscordClient, self)._request(
+            method, url, headers=headers, params=params, **aio_kwargs)
 
 
 class Flickr(OAuth1Client):
@@ -459,6 +452,38 @@ class Flickr(OAuth1Client):
             'fullname', {}).get('_content', '').partition(' ')
         yield 'first_name', first_name
         yield 'last_name', last_name
+
+
+class LichessClient(OAuth2Client):
+    """Support Lichess.
+
+    * Dashboard: https://lichess.org/account/oauth/app
+    * Docs: https://lichess.org/api#section/Authentication
+    * API reference: https://lichess.org/api
+    """
+
+    access_token_url = 'https://oauth.lichess.org/oauth'
+    authorize_url = 'https://oauth.lichess.org/oauth/authorize'
+    base_url = 'https://lichess.org/'
+    name = 'lichess'
+    user_info_url = 'https://lichess.org/api/account'
+
+    @staticmethod
+    def user_parse(data):
+        """Parse information from provider."""
+        yield 'id', data.get('id')
+        yield 'username', data.get('username')
+        yield 'first_name', data.get('profile').get("firstName")
+        yield 'last_name', data.get('profile').get("lastName")
+        yield 'country', data.get('profile').get("country")
+
+    def _request(self, method, url, headers=None, params=None, **aio_kwargs):
+        """Setup Authorization Header.."""
+        access_token = params.pop(self.access_token_key, None)
+        if access_token:
+            headers['Authorization'] = "Bearer %s" % access_token
+        return super(LichessClient, self)._request(
+            method, url, headers=headers, params=params, **aio_kwargs)
 
 
 class Meetup(OAuth1Client):
@@ -539,6 +564,7 @@ class TwitterClient(OAuth1Client):
         first_name, _, last_name = data['name'].partition(' ')
         yield 'first_name', first_name
         yield 'last_name', last_name
+        yield 'email', data.get('email')
         yield 'picture', data.get('profile_image_url')
         yield 'locale', data.get('lang')
         yield 'link', data.get('url')
@@ -691,15 +717,13 @@ class FacebookClient(OAuth2Client):
     name = 'facebook'
     user_info_url = 'https://graph.facebook.com/me'
 
-    @asyncio.coroutine
-    def user_info(self, params=None, **kwargs):
+    async def user_info(self, params=None, **kwargs):
         """Facebook required fields-param."""
         params = params or {}
         params[
             'fields'] = 'id,email,first_name,last_name,name,link,locale,' \
                         'gender,location'
-        return (yield from super(FacebookClient, self).user_info(params=params,
-                                                                 **kwargs))
+        return await super(FacebookClient, self).user_info(params=params, **kwargs)
 
     @staticmethod
     def user_parse(data):
@@ -793,25 +817,23 @@ class GoogleClient(OAuth2Client):
     * API explorer: https://developers.google.com/oauthplayground/
     """
 
-    access_token_url = 'https://accounts.google.com/o/oauth2/token'
-    authorize_url = 'https://accounts.google.com/o/oauth2/auth'
-    base_url = 'https://www.googleapis.com/plus/v1/'
+    authorize_url = 'https://accounts.google.com/o/oauth2/v2/auth'
+    access_token_url = 'https://www.googleapis.com/oauth2/v4/token'
+    base_url = 'https://www.googleapis.com/userinfo/v2/'
     name = 'google'
-    user_info_url = 'https://www.googleapis.com/plus/v1/people/me'
+    user_info_url = 'https://www.googleapis.com/userinfo/v2/me'
 
     @staticmethod
     def user_parse(data):
         """Parse information from provider."""
-        yield 'id', data.get('sub') or data.get('id')
-        yield 'username', data.get('nickname')
-        yield 'first_name', data.get('name', {}).get('givenName')
-        yield 'last_name', data.get('name', {}).get('familyName')
-        yield 'locale', data.get('language')
-        yield 'link', data.get('url')
-        yield 'picture', data.get('image', {}).get('url')
-        for email in data.get('emails', []):
-            if email['type'] == 'account':
-                yield 'email', email['value']
+        yield 'id', data.get('id')
+        yield 'email', data.get('email')
+        yield 'first_name', data.get('given_name')
+        yield 'last_name', data.get('family_name')
+        yield 'link', data.get('link')
+        yield 'locale', data.get('locale')
+        yield 'picture', data.get('picture')
+        yield 'gender', data.get('gender')
 
 
 class VKClient(OAuth2Client):
@@ -830,16 +852,17 @@ class VKClient(OAuth2Client):
     name = 'vk'
     base_url = 'https://api.vk.com'
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, version='5.9.2', *args, **kwargs):
         """Set default scope."""
         super(VKClient, self).__init__(*args, **kwargs)
+        self.user_info_url = "{0}&v={1}".format(self.user_info_url, version)
         self.params.setdefault('scope', 'offline')
 
     @staticmethod
     def user_parse(data):
         """Parse information from provider."""
         resp = data.get('response', [{}])[0]
-        yield 'id', resp.get('uid')
+        yield 'id', resp.get('id')
         yield 'first_name', resp.get('first_name')
         yield 'last_name', resp.get('last_name')
         yield 'username', resp.get('nickname')
@@ -959,5 +982,30 @@ class PinterestClient(OAuth2Client):
         yield 'first_name', data.get('first_name')
         yield 'last_name', data.get('last_name')
         yield 'link', data.get('url')
+
+
+class InstagramClient(OAuth2Client):
+    """Support Instagram
+
+		* Dashboard: https://www.instagram.com/developer/clients/manage/
+		* Docs: https://www.instagram.com/developer/
+    """
+
+    access_token_url = 'https://api.instagram.com/oauth/access_token'
+    authorize_url = 'https://api.instagram.com/oauth/authorize'
+    base_url = 'https://api.instagram.com/v1'
+    name = 'instagram'
+    user_info_url = 'https://api.instagram.com/v1/users/self'
+
+    @staticmethod
+    def user_parse(data):
+        """Parse information from the provider."""
+        user = data.get('data')
+        yield 'id', user.get('id')
+        yield 'username', user.get('username')
+        yield 'picture', user.get('profile_picture')
+        first_name, _, last_name = user.get('full_name', '').partition(' ')
+        yield 'first_name', first_name
+        yield 'last_name', last_name
 
 # pylama:ignore=E501
